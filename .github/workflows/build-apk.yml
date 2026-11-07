@@ -1,34 +1,45 @@
 name: Build installable Android APK
+
 on:
   workflow_dispatch:
   push:
-    branches: [ main, master ]
+    branches: [main, master]
 
 jobs:
   android-apk:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
     steps:
       - name: Checkout project
         uses: actions/checkout@v4
+
       - name: Java 17 for Android Gradle Plugin
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
+
+      # v3 tried to install the removed SDK package "tools" and failed.
+      # v4 no longer installs it. Only supported packages are requested.
       - name: Android SDK
-        uses: android-actions/setup-android@v3
-      - name: Install API 35 platform and build tools
+        uses: android-actions/setup-android@v4
+        with:
+          packages: 'platform-tools'
+
+      - name: Install Android API 35 and build tools
         run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
-      - name: Install Gradle 8.9
+
+      - name: Set up Gradle 8.9
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
+
       - name: Build debug APK
         working-directory: AndroidSender
         run: gradle --no-daemon :app:assembleDebug
-      - name: Upload APK for installation
+
+      - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
           name: PhoneToPC-Android-APK

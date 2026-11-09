@@ -1,0 +1,60 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Build APK (aapt2 + javac + d8 + apksigner, no Gradle)
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+          VERSION_NAME: 1.0.${{ github.run_number }}
+        run: bash android/build.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioBridge-android
+          path: android/build/AudioBridge.apk
+          if-no-files-found: error
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build EXE (built-in .NET Framework csc)
+        shell: cmd
+        run: windows\build.bat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AudioBridge-windows
+          path: windows/out/AudioBridge.exe
+          if-no-files-found: error
+
+  release:
+    needs: [android, windows]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: Publish "latest" release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release delete latest --yes --cleanup-tag || true
+          gh release create latest AudioBridge.apk AudioBridge.exe \
+            --target "${{ github.sha }}" \
+            --title "Audio Bridge (build ${{ github.run_number }})" \
+            --notes "AudioBridge.apk: install on the Android phone. AudioBridge.exe: run on Windows 10/11 (no install needed)."

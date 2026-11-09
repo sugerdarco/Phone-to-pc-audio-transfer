@@ -1,0 +1,4 @@
+android/build/
+windows/out/
+*.apk
+*.exe

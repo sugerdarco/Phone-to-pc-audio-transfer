@@ -89,71 +89,75 @@ public class StreamService extends Service {
     }
 
     private void runAudioLoop(String targetIp, int targetPort, boolean useInternal) {
-        AudioRecord recorder = null;
-        DatagramSocket socket = null;
+    AudioRecord recorder = null;
+    DatagramSocket socket = null;
 
-        try {
-            int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNELS, ENCODING);
-            int bufferSize = Math.max(minBuf * 2, PCM_PACKET_SIZE * 4);
+    try {
+        int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNELS, ENCODING);
+        int bufferSize = Math.max(minBuf * 2, PCM_PACKET_SIZE * 4);
 
-            AudioFormat audioFormat = new AudioFormat.Builder()
-                    .setEncoding(ENCODING)
-                    .setSampleRate(SAMPLE_RATE)
-                    .setChannelMask(CHANNELS)
+        AudioFormat audioFormat = new AudioFormat.Builder()
+                .setEncoding(ENCODING)
+                .setSampleRate(SAMPLE_RATE)
+                .setChannelMask(CHANNELS)
+                .build();
+
+        if (useInternal && mediaProjection != null) {
+            AudioPlaybackCaptureConfiguration config =
+                    new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
+                            .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                            .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                            .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                            .addMatchingUsage(AudioAttributes.USAGE_ASSISTANT)
+                            .build();
+
+            recorder = new AudioRecord.Builder()
+                    .setAudioFormat(audioFormat)
+                    .setBufferSizeInBytes(bufferSize)
+                    .setAudioPlaybackCaptureConfig(config)
                     .build();
+        } else {
+            recorder = new AudioRecord(
+                    MediaRecorder.AudioSource.MIC,
+                    SAMPLE_RATE,
+                    CHANNELS,
+                    ENCODING,
+                    bufferSize
+            );
+        }
 
-            if (useInternal && mediaProjection != null) {
-                AudioPlaybackCaptureConfiguration config =
-                        new AudioPlaybackCaptureConfiguration.Builder(mediaProjection)
-                                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
-                                .addMatchingUsage(AudioAttributes.USAGE_GAME)
-                                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
-                                .build();
+        socket = new DatagramSocket();
+        socket.setTrafficClass(0x10); // IPTOS_LOWDELAY
+        InetAddress address = InetAddress.getByName(targetIp);
 
-                recorder = new AudioRecord.Builder()
-                        .setAudioFormat(audioFormat)
-                        .setBufferSizeInBytes(bufferSize)
-                        .setAudioPlaybackCaptureConfig(config)
-                        .build();
+        byte[] pcmBuffer = new byte[PCM_PACKET_SIZE];
+        recorder.startRecording();
+
+        // Audio pipeline loop
+        while (isRunning.get()) {
+            int read = recorder.read(pcmBuffer, 0, pcmBuffer.length);
+            if (read > 0) {
+                DatagramPacket packet = new DatagramPacket(pcmBuffer, read, address, targetPort);
+                socket.send(packet);
             } else {
-                recorder = new AudioRecord(
-                        MediaRecorder.AudioSource.MIC,
-                        SAMPLE_RATE,
-                        CHANNELS,
-                        ENCODING,
-                        bufferSize
-                );
-            }
-
-            socket = new DatagramSocket();
-            socket.setTrafficClass(0x10);
-            InetAddress address = InetAddress.getByName(targetIp);
-
-            byte[] pcmBuffer = new byte[PCM_PACKET_SIZE];
-            recorder.startRecording();
-
-            while (isRunning.get()) {
-                int read = recorder.read(pcmBuffer, 0, pcmBuffer.length);
-                if (read > 0) {
-                    DatagramPacket packet = new DatagramPacket(pcmBuffer, read, address, targetPort);
-                    socket.send(packet);
-                }
-            }
-        } catch (Exception e) {
-            e.printStackTrace();
-        } finally {
-            if (recorder != null) {
-                try {
-                    recorder.stop();
-                    recorder.release();
-                } catch (Exception ignored) {}
-            }
-            if (socket != null) {
-                socket.close();
+                // Prevent CPU spin if audio buffer temporarily underflows
+                Thread.sleep(2);
             }
         }
+    } catch (Exception e) {
+        e.printStackTrace();
+    } finally {
+        if (recorder != null) {
+            try {
+                recorder.stop();
+                recorder.release();
+            } catch (Exception ignored) {}
+        }
+        if (socket != null) {
+            socket.close();
+        }
     }
-
+}
     private void stopStreaming() {
         isRunning.set(false);
         if (workerThread != null) {

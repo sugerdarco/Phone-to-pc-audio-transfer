@@ -22,7 +22,9 @@ import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
 import android.view.WindowInsets;
+import android.provider.Settings;
 import android.widget.Button;
+import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
@@ -51,6 +53,7 @@ public class MainActivity extends Activity {
     private EditText hostInput;
     private RadioButton phoneAudio;
     private RadioButton micAudio;
+    private CheckBox muteBox;
     private Button startButton;
     private Button findButton;
     private TextView statusText;
@@ -123,7 +126,19 @@ public class MainActivity extends Activity {
             }
         });
         hostRow.addView(findButton);
-        root.addView(hostRow, margins(0, 0, 0, dp(20)));
+        root.addView(hostRow, margins(0, 0, 0, dp(4)));
+
+        Button usbButton = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        usbButton.setText("Use USB cable instead of Wi-Fi…");
+        usbButton.setAllCaps(false);
+        usbButton.setGravity(Gravity.START | Gravity.CENTER_VERTICAL);
+        usbButton.setOnClickListener(new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                openUsbTethering();
+            }
+        });
+        root.addView(usbButton, margins(0, 0, 0, dp(16)));
 
         root.addView(label("Audio source"));
         RadioGroup source = new RadioGroup(this);
@@ -136,7 +151,12 @@ public class MainActivity extends Activity {
         source.addView(phoneAudio);
         source.addView(micAudio);
         if (prefs.getBoolean("mic", false)) micAudio.setChecked(true); else phoneAudio.setChecked(true);
-        root.addView(source, margins(0, 0, 0, dp(24)));
+        root.addView(source, margins(0, 0, 0, dp(8)));
+
+        muteBox = new CheckBox(this);
+        muteBox.setText("Mute phone speaker while streaming");
+        muteBox.setChecked(prefs.getBoolean("mute", true));
+        root.addView(muteBox, margins(0, 0, 0, dp(24)));
 
         startButton = new Button(this);
         startButton.setTextSize(18);
@@ -155,10 +175,11 @@ public class MainActivity extends Activity {
 
         TextView help = text(
                 "1. Open Audio Bridge on the Windows PC.\n" +
-                "2. Connect both to the same Wi-Fi (or phone hotspot).\n" +
+                "2. Connect both to the same Wi-Fi, or plug in a USB cable and turn on USB tethering " +
+                "(no USB debugging needed).\n" +
                 "3. Tap Find PC, then Start, and choose “Entire screen” if asked.\n\n" +
-                "Audio keeps playing on the phone too. Apps that block recording " +
-                "(some DRM video apps, calls) stay silent on the PC.");
+                "Audio is sent uncompressed (48 kHz 16-bit PCM, better than Bluetooth LDAC). " +
+                "Apps that block recording (some DRM video apps, calls) stay silent on the PC.");
         help.setAlpha(0.6f);
         help.setTextSize(13);
         root.addView(help);
@@ -186,6 +207,7 @@ public class MainActivity extends Activity {
         findButton.setEnabled(!running);
         phoneAudio.setEnabled(!running);
         micAudio.setEnabled(!running);
+        muteBox.setEnabled(!running);
     }
 
     private void onStartStop() {
@@ -198,7 +220,8 @@ public class MainActivity extends Activity {
             Toast.makeText(this, "Enter the PC address or tap Find PC", Toast.LENGTH_SHORT).show();
             return;
         }
-        prefs.edit().putString("host", host).putBoolean("mic", micAudio.isChecked()).apply();
+        prefs.edit().putString("host", host).putBoolean("mic", micAudio.isChecked())
+                .putBoolean("mute", muteBox.isChecked()).apply();
 
         List<String> missing = new ArrayList<>();
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
@@ -257,6 +280,7 @@ public class MainActivity extends Activity {
                 .setAction(StreamService.ACTION_START)
                 .putExtra(StreamService.EXTRA_HOST, hostInput.getText().toString().trim())
                 .putExtra(StreamService.EXTRA_MIC, micAudio.isChecked())
+                .putExtra(StreamService.EXTRA_MUTE, muteBox.isChecked())
                 .putExtra(StreamService.EXTRA_RESULT_CODE, resultCode)
                 .putExtra(StreamService.EXTRA_RESULT_DATA, data);
         StreamService.status = "Starting…";
@@ -285,10 +309,54 @@ public class MainActivity extends Activity {
         }, "discovery").start();
     }
 
+    /** Opens Android's tethering screen; USB tethering gives a wired network to the PC. */
+    private void openUsbTethering() {
+        new AlertDialog.Builder(this)
+                .setTitle("USB cable")
+                .setMessage("1. Connect the phone to the PC with a USB cable.\n" +
+                        "2. On the next screen, turn on “USB tethering”.\n" +
+                        "3. Come back and tap Find PC.\n\n" +
+                        "No USB debugging needed. If Find PC can't see the PC, click " +
+                        "“Allow through Windows Firewall” in the PC app once.")
+                .setPositiveButton("Open settings", new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int which) {
+                        String[] actions = {"android.settings.TETHER_SETTINGS",
+                                Settings.ACTION_WIRELESS_SETTINGS, Settings.ACTION_SETTINGS};
+                        for (String a : actions) {
+                            try {
+                                startActivity(new Intent(a));
+                                return;
+                            } catch (Exception ignored) {
+                            }
+                        }
+                    }
+                })
+                .setNegativeButton("Cancel", null)
+                .show();
+    }
+
     private List<InetAddress> broadcastTargets() {
         List<InetAddress> out = new ArrayList<>();
         try {
             out.add(InetAddress.getByName("255.255.255.255"));
+            // Every interface, including USB tethering (rndis/ncm), which apps don't see as a "Network".
+            java.util.Enumeration<java.net.NetworkInterface> ifs = java.net.NetworkInterface.getNetworkInterfaces();
+            while (ifs != null && ifs.hasMoreElements()) {
+                java.net.NetworkInterface ni = ifs.nextElement();
+                try {
+                    if (!ni.isUp() || ni.isLoopback()) continue;
+                } catch (Exception e) {
+                    continue;
+                }
+                for (java.net.InterfaceAddress ia : ni.getInterfaceAddresses()) {
+                    InetAddress bc = ia.getBroadcast();
+                    if (bc != null && !out.contains(bc)) out.add(bc);
+                }
+            }
+        } catch (Exception ignored) {
+        }
+        try {
             ConnectivityManager cm = getSystemService(ConnectivityManager.class);
             for (Network net : cm.getAllNetworks()) {
                 LinkProperties lp = cm.getLinkProperties(net);

@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Net;
 using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Reflection;
@@ -38,11 +39,11 @@ namespace AudioBridge
 
     internal sealed class MainForm : Form
     {
-        private static readonly int[] LatencyMs = { 30, 60, 120 };
-        private static readonly string[] LatencyNames = { "Low (30 ms)", "Normal (60 ms)", "Stable (120 ms)" };
+        private static readonly int[] LatencyMs = { 30, 80, 150 };
+        private static readonly string[] LatencyNames = { "Low, 30 ms (USB cable)", "Normal, 80 ms", "Stable, 150 ms (weak Wi-Fi)" };
 
-        private readonly PcmBuffer buffer = new PcmBuffer();
-        private UdpAudioReceiver receiver;
+        private readonly JitterBuffer buffer = new JitterBuffer();
+        private AudioReceiver receiver;
         private WaveOutPlayer player;
 
         private readonly Label ipLabel = new Label();
@@ -58,6 +59,8 @@ namespace AudioBridge
         private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
         private readonly Dictionary<string, string> settings = new Dictionary<string, string>();
         private bool trayHintShown;
+        private IPAddress lastPeer;
+        private bool lastPeerUsb;
 
         private static string SettingsPath
         {
@@ -112,20 +115,26 @@ namespace AudioBridge
             level.Size = new Size(290, 10);
             AddRow(grid, 4, "Level", level);
 
+            var fw = new Button();
+            fw.Text = "Allow through Windows Firewall";
+            fw.AutoSize = true;
+            fw.Click += delegate { FixFirewall(); };
+            AddRow(grid, 5, "Firewall", fw);
+
             deviceBox.DropDownStyle = ComboBoxStyle.DropDownList;
             deviceBox.Width = 290;
             deviceBox.Items.Add("Default output device");
             foreach (string d in WinMM.OutputDevices()) deviceBox.Items.Add(d);
             deviceBox.SelectedIndex = Math.Max(0, deviceBox.Items.IndexOf(Get("device", "")));
             deviceBox.SelectedIndexChanged += delegate { Set("device", deviceBox.SelectedIndex == 0 ? "" : (string)deviceBox.SelectedItem); RestartPlayer(); };
-            AddRow(grid, 5, "Output", deviceBox);
+            AddRow(grid, 6, "Output", deviceBox);
 
             latencyBox.DropDownStyle = ComboBoxStyle.DropDownList;
             latencyBox.Width = 290;
             latencyBox.Items.AddRange(LatencyNames);
             latencyBox.SelectedIndex = Clamp(ParseInt(Get("latency", "1"), 1), 0, 2);
             latencyBox.SelectedIndexChanged += delegate { ApplyLatency(); Set("latency", latencyBox.SelectedIndex.ToString()); };
-            AddRow(grid, 6, "Buffer", latencyBox);
+            AddRow(grid, 7, "Buffer", latencyBox);
 
             var volPanel = new FlowLayoutPanel();
             volPanel.AutoSize = true;
@@ -141,22 +150,24 @@ namespace AudioBridge
             volumeLabel.Margin = new Padding(3, 8, 3, 0);
             volPanel.Controls.Add(volume);
             volPanel.Controls.Add(volumeLabel);
-            AddRow(grid, 7, "Volume", volPanel);
+            AddRow(grid, 8, "Volume", volPanel);
 
             trayBox.Text = "Minimize to system tray";
             trayBox.AutoSize = true;
             trayBox.Checked = Get("tray", "1") == "1";
             trayBox.CheckedChanged += delegate { Set("tray", trayBox.Checked ? "1" : "0"); };
-            grid.Controls.Add(trayBox, 1, 8);
+            grid.Controls.Add(trayBox, 1, 9);
 
             var help = new Label();
-            help.Text = "Open Audio Bridge on the phone, tap \"Find PC\" (or type the address above) and press Start. " +
-                        "Phone and PC must be on the same network. Allow the app through Windows Firewall (Private networks) when asked.";
+            help.Text = "Wi-Fi: put phone and PC on the same network.\nUSB cable: plug in and turn on USB tethering on the phone " +
+                        "(Settings > Network > Hotspot & tethering).\nThen tap Find PC and Start in the phone app. " +
+                        "If the phone can't find this PC, click \"Allow through Windows Firewall\".";
+            help.UseMnemonic = false;
             help.ForeColor = SystemColors.GrayText;
             help.AutoSize = true;
             help.MaximumSize = new Size(390, 0);
             help.Margin = new Padding(3, 10, 3, 0);
-            grid.Controls.Add(help, 0, 9);
+            grid.Controls.Add(help, 0, 10);
             grid.SetColumnSpan(help, 2);
 
             Controls.Add(grid);
@@ -173,11 +184,11 @@ namespace AudioBridge
             ApplyVolume();
             ipLabel.Text = LocalAddresses();
 
-            receiver = new UdpAudioReceiver(buffer);
+            receiver = new AudioReceiver(buffer);
             try { receiver.Start(); }
             catch (Exception ex)
             {
-                receiver.Error = "Cannot listen on UDP port " + UdpAudioReceiver.Port + ": " + ex.Message;
+                receiver.Error = "Cannot listen on UDP port " + AudioReceiver.Port + ": " + ex.Message;
             }
             RestartPlayer();
 
@@ -222,7 +233,9 @@ namespace AudioBridge
         private void RefreshStatus()
         {
             string err = (receiver != null ? receiver.Error : null) ?? (player != null ? player.Error : null);
-            string from = receiver != null ? receiver.CurrentSender : null;
+            IPAddress fromIp = receiver != null ? receiver.CurrentSender : null;
+            if (fromIp != null && !fromIp.Equals(lastPeer)) { lastPeer = fromIp; lastPeerUsb = IsUsbPeer(fromIp); }
+            string from = fromIp == null ? null : fromIp + (lastPeerUsb ? " (USB cable)" : "");
             if (err != null)
             {
                 statusLabel.Text = err;
@@ -235,12 +248,11 @@ namespace AudioBridge
             }
             else
             {
-                statusLabel.Text = "Waiting for phone on UDP port " + UdpAudioReceiver.Port + "…";
+                statusLabel.Text = "Waiting for phone (Wi-Fi or USB tethering)…";
                 statusLabel.ForeColor = SystemColors.ControlText;
             }
-            statsLabel.Text = string.Format("buffer {0} ms · lost {1} · underruns {2} · skips {3}",
-                from != null ? buffer.BufferedMs : 0,
-                receiver != null ? receiver.Lost : 0, buffer.Underruns, buffer.Skips);
+            statsLabel.Text = string.Format("48 kHz 16-bit PCM, uncompressed · buffer {0} ms\nrepaired {1} · lost {2} · underruns {3}",
+                from != null ? buffer.BufferedMs : 0, buffer.Recovered, buffer.Concealed, buffer.Underruns);
             int peak = from != null ? buffer.Peak : 0;
             level.Value = Clamp((int)(Math.Sqrt(peak / 32767.0) * 100), 0, 100);
             tray.Text = from != null ? "Audio Bridge – playing from " + from : "Audio Bridge – waiting";
@@ -259,11 +271,81 @@ namespace AudioBridge
                     .SelectMany(n => n.GetIPProperties().UnicastAddresses)
                     .Where(a => a.Address.AddressFamily == AddressFamily.InterNetwork &&
                                 !a.Address.ToString().StartsWith("169.254."))
-                    .Select(a => a.Address.ToString())
+                    .Select(a => a.Address.ToString() + InterfaceKind(a.Address))
                     .Distinct().ToArray();
                 return ips.Length == 0 ? "not connected to a network" : string.Join("\n", ips);
             }
             catch { return "run ipconfig to find it"; }
+        }
+
+        private static bool IsUsbDescription(string d)
+        {
+            d = d.ToLowerInvariant();
+            return d.Contains("ndis") || d.Contains("ncm") || d.Contains("usb") || d.Contains("android");
+        }
+
+        // "  (USB)" / "  (Wi-Fi)" label for the adapter that owns this local address.
+        private static string InterfaceKind(IPAddress local)
+        {
+            foreach (var n in NetworkInterface.GetAllNetworkInterfaces())
+                foreach (var a in n.GetIPProperties().UnicastAddresses)
+                    if (a.Address.Equals(local))
+                    {
+                        if (IsUsbDescription(n.Description)) return "  (USB)";
+                        if (n.NetworkInterfaceType == NetworkInterfaceType.Wireless80211) return "  (Wi-Fi)";
+                        return "";
+                    }
+            return "";
+        }
+
+        private static bool IsUsbPeer(IPAddress peer)
+        {
+            try
+            {
+                byte[] p = peer.GetAddressBytes();
+                foreach (var n in NetworkInterface.GetAllNetworkInterfaces())
+                {
+                    if (n.OperationalStatus != OperationalStatus.Up || !IsUsbDescription(n.Description)) continue;
+                    foreach (var a in n.GetIPProperties().UnicastAddresses)
+                    {
+                        if (a.Address.AddressFamily != AddressFamily.InterNetwork || a.IPv4Mask == null) continue;
+                        byte[] l = a.Address.GetAddressBytes(), m = a.IPv4Mask.GetAddressBytes();
+                        bool same = true;
+                        for (int i = 0; i < 4; i++) if ((l[i] & m[i]) != (p[i] & m[i])) same = false;
+                        if (same) return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        // USB tethering appears in Windows as a new "Public" network, where the firewall blocks the
+        // app by default. Replace any rules for this exe with one allow rule for all network types.
+        private void FixFirewall()
+        {
+            string exe = Application.ExecutablePath;
+            string args = "/c netsh advfirewall firewall delete rule name=all program=\"" + exe + "\" & " +
+                          "netsh advfirewall firewall add rule name=\"Audio Bridge\" dir=in action=allow program=\"" + exe +
+                          "\" protocol=udp localport=" + AudioReceiver.Port + " profile=any enable=yes";
+            var psi = new System.Diagnostics.ProcessStartInfo("cmd.exe", args);
+            psi.Verb = "runas"; // Windows asks for administrator permission
+            psi.UseShellExecute = true;
+            psi.WindowStyle = System.Diagnostics.ProcessWindowStyle.Hidden;
+            try
+            {
+                using (var p = System.Diagnostics.Process.Start(psi))
+                {
+                    p.WaitForExit(15000);
+                    MessageBox.Show(this, p.ExitCode == 0
+                        ? "Done. Audio Bridge can now receive over Wi-Fi and USB tethering."
+                        : "Windows Firewall could not be updated (code " + p.ExitCode + ").", "Audio Bridge");
+                }
+            }
+            catch (System.ComponentModel.Win32Exception)
+            {
+                // UAC prompt was cancelled
+            }
         }
 
         protected override void OnResize(EventArgs e)

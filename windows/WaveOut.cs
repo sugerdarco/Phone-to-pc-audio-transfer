@@ -1,4 +1,4 @@
-// Minimal WinMM waveOut player. Pulls PCM from a PcmBuffer on its own thread.
+// Minimal WinMM waveOut player. Pulls PCM from a JitterBuffer on its own thread.
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -87,18 +87,18 @@ namespace AudioBridge
     internal sealed class WaveOutPlayer : IDisposable
     {
         private const int BufferCount = 4;
-        private readonly PcmBuffer source;
+        private readonly JitterBuffer source;
         private readonly int deviceId;
         private readonly int bufferBytes;
         private Thread thread;
         private volatile bool running;
         public volatile string Error;
 
-        public WaveOutPlayer(PcmBuffer source, int deviceId, int bufferMs)
+        public WaveOutPlayer(JitterBuffer source, int deviceId, int bufferMs)
         {
             this.source = source;
             this.deviceId = deviceId;
-            bufferBytes = PcmBuffer.BytesPerMs * bufferMs;
+            bufferBytes = 192 * bufferMs; // 48 kHz stereo 16-bit
         }
 
         public void Start()
@@ -115,11 +115,11 @@ namespace AudioBridge
         {
             var fmt = new WinMM.WAVEFORMATEX();
             fmt.wFormatTag = 1; // PCM
-            fmt.nChannels = PcmBuffer.Channels;
-            fmt.nSamplesPerSec = PcmBuffer.SampleRate;
+            fmt.nChannels = 2;
+            fmt.nSamplesPerSec = JitterBuffer.SampleRate;
             fmt.wBitsPerSample = 16;
-            fmt.nBlockAlign = (short)(PcmBuffer.Channels * 2);
-            fmt.nAvgBytesPerSec = PcmBuffer.SampleRate * fmt.nBlockAlign;
+            fmt.nBlockAlign = 4;
+            fmt.nAvgBytesPerSec = JitterBuffer.SampleRate * 4;
 
             int hdrSize = Marshal.SizeOf(typeof(WinMM.WAVEHDR));
             int flagsOffset = (int)Marshal.OffsetOf(typeof(WinMM.WAVEHDR), "dwFlags");
@@ -145,7 +145,7 @@ namespace AudioBridge
                         h.dwBufferLength = bufferBytes;
                         Marshal.StructureToPtr(h, headers[i], false);
                         WinMM.waveOutPrepareHeader(hwo, headers[i], hdrSize);
-                        source.Pull(managed, bufferBytes);
+                        SafePull(managed);
                         Marshal.Copy(managed, 0, datas[i], bufferBytes);
                         WinMM.waveOutWrite(hwo, headers[i], hdrSize);
                     }
@@ -157,7 +157,7 @@ namespace AudioBridge
                         {
                             int flags = Marshal.ReadInt32(headers[i], flagsOffset);
                             if ((flags & WinMM.WHDR_DONE) == 0) continue;
-                            source.Pull(managed, bufferBytes);
+                            SafePull(managed);
                             Marshal.Copy(managed, 0, datas[i], bufferBytes);
                             rc = WinMM.waveOutWrite(hwo, headers[i], hdrSize);
                             if (rc != 0) { Error = "Audio device error (WinMM " + rc + ")"; running = false; }
@@ -184,6 +184,13 @@ namespace AudioBridge
                     }
                 }
             }
+        }
+
+        private void SafePull(byte[] managed)
+        {
+            // A bug in the buffer must never kill playback: output one block of silence instead.
+            try { source.Pull(managed, bufferBytes); }
+            catch { Array.Clear(managed, 0, managed.Length); }
         }
 
         public void Dispose()

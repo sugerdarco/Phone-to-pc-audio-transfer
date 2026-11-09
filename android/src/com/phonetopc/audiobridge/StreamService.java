@@ -10,6 +10,7 @@ import android.content.pm.ServiceInfo;
 import android.graphics.drawable.Icon;
 import android.media.AudioAttributes;
 import android.media.AudioFormat;
+import android.media.AudioManager;
 import android.media.AudioPlaybackCaptureConfiguration;
 import android.media.AudioRecord;
 import android.media.MediaRecorder;
@@ -28,20 +29,23 @@ import java.net.DatagramSocket;
 import java.net.InetAddress;
 
 /**
- * Captures phone audio (or the mic) and streams it to the PC as raw PCM over UDP.
- * Packet: "PAU1" | uint32 LE sequence | 960 bytes s16le 48 kHz stereo (5 ms).
+ * Captures phone audio (or the mic) and streams it to the PC as uncompressed PCM over UDP
+ * (Wi-Fi, hotspot or USB tethering).
+ * Packet: "PAU2" | uint32 LE seq | 480 bytes s16le 48 kHz stereo (2.5 ms) | the chunk of seq-8.
  */
 public class StreamService extends Service {
     public static final String ACTION_START = "com.phonetopc.audiobridge.START";
     public static final String ACTION_STOP = "com.phonetopc.audiobridge.STOP";
     public static final String EXTRA_HOST = "host";
     public static final String EXTRA_MIC = "mic";
+    public static final String EXTRA_MUTE = "mute";
     public static final String EXTRA_RESULT_CODE = "resultCode";
     public static final String EXTRA_RESULT_DATA = "resultData";
 
     public static final int PORT = 45999;
     private static final int SAMPLE_RATE = 48000;
-    private static final int CHUNK_BYTES = 960; // 5 ms of 48 kHz stereo 16-bit
+    private static final int CHUNK_BYTES = 480; // 2.5 ms of 48 kHz stereo 16-bit
+    private static final int REDUNDANCY = 8;    // each packet also carries the chunk from 20 ms earlier
     private static final String CHANNEL_ID = "stream";
     private static final int NOTIFICATION_ID = 1;
 
@@ -56,6 +60,7 @@ public class StreamService extends Service {
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
     private String host = "";
+    private int savedVolume = -1;
 
     @Override
     public IBinder onBind(Intent intent) {
@@ -72,6 +77,7 @@ public class StreamService extends Service {
 
         host = intent.getStringExtra(EXTRA_HOST);
         boolean mic = intent.getBooleanExtra(EXTRA_MIC, false);
+        boolean muteSpeaker = intent.getBooleanExtra(EXTRA_MUTE, true) && !mic;
         int resultCode = intent.getIntExtra(EXTRA_RESULT_CODE, 0);
         Intent resultData = Build.VERSION.SDK_INT >= 33
                 ? intent.getParcelableExtra(EXTRA_RESULT_DATA, Intent.class)
@@ -121,6 +127,7 @@ public class StreamService extends Service {
         }
 
         acquireLocks();
+        if (muteSpeaker) muteSpeaker();
         running = true;
         active = true;
         status = "Starting…";
@@ -149,7 +156,7 @@ public class StreamService extends Service {
                     .build();
             int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE, AudioFormat.CHANNEL_IN_STEREO,
                     AudioFormat.ENCODING_PCM_16BIT);
-            int bufSize = Math.max(minBuf * 2, CHUNK_BYTES * 16);
+            int bufSize = Math.max(minBuf * 4, SAMPLE_RATE * 4 / 10); // >= 100 ms so a busy CPU never drops audio
 
             AudioRecord.Builder b = new AudioRecord.Builder().setAudioFormat(fmt).setBufferSizeInBytes(bufSize);
             if (mic) {
@@ -172,8 +179,10 @@ public class StreamService extends Service {
             socket.setTrafficClass(0xB8); // DSCP EF: ask Wi-Fi for voice-priority queueing
             socket.setSendBufferSize(64 * 1024);
 
-            byte[] pkt = new byte[8 + CHUNK_BYTES];
-            pkt[0] = 'P'; pkt[1] = 'A'; pkt[2] = 'U'; pkt[3] = '1';
+            // Packet: "PAU2" | seq | chunk[seq] | chunk[seq - 8]  (the old copy repairs lost packets)
+            byte[] pkt = new byte[8 + 2 * CHUNK_BYTES];
+            pkt[0] = 'P'; pkt[1] = 'A'; pkt[2] = 'U'; pkt[3] = '2';
+            byte[][] history = new byte[REDUNDANCY][CHUNK_BYTES];
             DatagramPacket dp = new DatagramPacket(pkt, pkt.length, addr, PORT);
 
             rec.startRecording();
@@ -186,18 +195,24 @@ public class StreamService extends Service {
             updateNotification("Streaming " + label + " to " + target);
 
             while (active) {
-                int n = rec.read(pkt, 8, CHUNK_BYTES, AudioRecord.READ_BLOCKING);
-                if (n < 0) throw new IllegalStateException("audio read error " + n);
-                if (n == 0) continue;
+                int got = 0;
+                while (got < CHUNK_BYTES && active) {
+                    int n = rec.read(pkt, 8 + got, CHUNK_BYTES - got, AudioRecord.READ_BLOCKING);
+                    if (n < 0) throw new IllegalStateException("audio read error " + n);
+                    got += n;
+                }
+                if (!active) break;
                 pkt[4] = (byte) seq;
                 pkt[5] = (byte) (seq >>> 8);
                 pkt[6] = (byte) (seq >>> 16);
                 pkt[7] = (byte) (seq >>> 24);
+                byte[] old = history[seq % REDUNDANCY];          // chunk from 8 packets (20 ms) ago
+                System.arraycopy(old, 0, pkt, 8 + CHUNK_BYTES, CHUNK_BYTES);
+                System.arraycopy(pkt, 8, old, 0, CHUNK_BYTES);   // remember this chunk
                 seq++;
-                dp.setLength(8 + n);
                 try {
                     socket.send(dp);
-                    bytesSent += 8 + n;
+                    bytesSent += pkt.length;
                     if (netError) {
                         netError = false;
                         status = "Streaming " + label + " to " + target;
@@ -249,6 +264,36 @@ public class StreamService extends Service {
             try { p.stop(); } catch (Exception ignored) { }
         }
         releaseLocks();
+        restoreSpeaker();
+    }
+
+    /**
+     * Silences the phone's own speaker/headphones. Android feeds the capture at full level
+     * independent of the media volume, so the PC still gets the complete signal.
+     */
+    private void muteSpeaker() {
+        try {
+            AudioManager am = getSystemService(AudioManager.class);
+            int v = am.getStreamVolume(AudioManager.STREAM_MUSIC);
+            if (v > 0) {
+                savedVolume = v;
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, 0, 0);
+            }
+        } catch (Exception ignored) {
+        }
+    }
+
+    private void restoreSpeaker() {
+        if (savedVolume < 0) return;
+        try {
+            AudioManager am = getSystemService(AudioManager.class);
+            // Only restore if the user didn't change the volume themselves while streaming.
+            if (am.getStreamVolume(AudioManager.STREAM_MUSIC) == 0) {
+                am.setStreamVolume(AudioManager.STREAM_MUSIC, savedVolume, 0);
+            }
+        } catch (Exception ignored) {
+        }
+        savedVolume = -1;
     }
 
     private void shutdown(String finalStatus) {

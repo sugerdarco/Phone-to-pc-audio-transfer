@@ -364,7 +364,12 @@ public class MainActivity extends Activity {
         for (int i = 0; i < ips.length; i++) labels[i] = found.get(ips[i]) + "  (" + ips[i] + ")";
         new AlertDialog.Builder(this)
                 .setTitle("Choose your PC")
-                .setItems(labels, (d, which) -> hostInput.setText(ips[which]))
+                .setItems(labels, new android.content.DialogInterface.OnClickListener() {
+                    @Override
+                    public void onClick(android.content.DialogInterface d, int which) {
+                        hostInput.setText(ips[which]);
+                    }
+                })
                 .show();
     }
 

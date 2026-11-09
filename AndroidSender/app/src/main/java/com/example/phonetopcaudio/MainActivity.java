@@ -2,115 +2,158 @@ package com.example.phonetopcaudio;
 
 import android.Manifest;
 import android.app.Activity;
+import android.content.Context;
 import android.content.Intent;
+import android.content.SharedPreferences;
 import android.content.pm.PackageManager;
 import android.media.projection.MediaProjectionManager;
+import android.os.Build;
 import android.os.Bundle;
+import android.text.InputType;
 import android.widget.Button;
 import android.widget.EditText;
 import android.widget.LinearLayout;
+import android.widget.RadioButton;
+import android.widget.RadioGroup;
 import android.widget.TextView;
-import android.text.InputType;
-import android.util.Patterns;
-import android.view.ViewGroup;
+import android.widget.Toast;
 
-public final class MainActivity extends Activity {
-    private static final int AUDIO_PERMISSION_REQUEST = 101;
-    private static final int PROJECTION_REQUEST = 102;
-    private EditText hostField;
-    private TextView status;
-    private String requestedHost;
+public class MainActivity extends Activity {
+    private static final int REQ_PERMS = 100;
+    private static final int REQ_PROJECTION = 101;
 
-    @Override public void onCreate(Bundle state) {
-        super.onCreate(state);
-        LinearLayout column = new LinearLayout(this);
-        column.setOrientation(LinearLayout.VERTICAL);
-        column.setPadding(28, 44, 28, 28);
-        TextView heading = new TextView(this);
-        heading.setText("Phone → PC Audio");
-        heading.setTextSize(24);
-        column.addView(heading);
-        TextView help = new TextView(this);
-        help.setText("1. Start the Windows receiver.\n2. Enter its IPv4 address.\n3. Tap Start and approve Android's capture prompt.\n\nBoth devices must use the same trusted local network.");
-        help.setPadding(0, 24, 0, 14);
-        column.addView(help);
-        hostField = new EditText(this);
-        hostField.setSingleLine(true);
-        hostField.setHint("Windows IPv4 address, e.g. 192.168.1.50");
-        hostField.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI);
-        hostField.setText(getPreferences(MODE_PRIVATE).getString("lastHost", ""));
-        column.addView(hostField, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
-        Button start = new Button(this);
-        start.setText("Start sending audio");
-        start.setOnClickListener(v -> requestStart());
-        column.addView(start);
-        Button stop = new Button(this);
-        stop.setText("Stop streaming");
-        stop.setOnClickListener(v -> {
-            stopService(new Intent(this, StreamService.class));
-            status.setText("Stopped");
-        });
-        column.addView(stop);
-        status = new TextView(this);
-        status.setText("Not streaming");
-        status.setPadding(0, 18, 0, 10);
-        column.addView(status);
-        TextView details = new TextView(this);
-        details.setText("Captures allowed game/media audio only. Calls, protected media and apps that block capture will be silent. The app does not transmit your microphone or video. The phone may still play audio locally.");
-        column.addView(details);
-        setContentView(column);
+    private EditText ipInput;
+    private EditText portInput;
+    private RadioButton rbInternal;
+    private RadioButton rbMic;
+    private TextView statusText;
+    private SharedPreferences prefs;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        prefs = getSharedPreferences("PhoneToPC", MODE_PRIVATE);
+
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setPadding(64, 96, 64, 64);
+
+        TextView title = new TextView(this);
+        title.setText("PhoneToPC Audio (Android 15)");
+        title.setTextSize(22f);
+        root.addView(title);
+
+        TextView ipLabel = new TextView(this);
+        ipLabel.setText("\nWindows 11 PC IP Address:");
+        root.addView(ipLabel);
+
+        ipInput = new EditText(this);
+        ipInput.setHint("e.g. 192.168.1.100");
+        ipInput.setText(prefs.getString("ip", "192.168.1.100"));
+        root.addView(ipInput);
+
+        TextView portLabel = new TextView(this);
+        portLabel.setText("\nUDP Port:");
+        root.addView(portLabel);
+
+        portInput = new EditText(this);
+        portInput.setInputType(InputType.TYPE_CLASS_NUMBER);
+        portInput.setText(String.valueOf(prefs.getInt("port", 50005)));
+        root.addView(portInput);
+
+        TextView modeLabel = new TextView(this);
+        modeLabel.setText("\nAudio Source:");
+        root.addView(modeLabel);
+
+        RadioGroup modeGroup = new RadioGroup(this);
+        rbInternal = new RadioButton(this);
+        rbInternal.setText("Internal System Audio (Media/Games)");
+        rbInternal.setChecked(true);
+        rbMic = new RadioButton(this);
+        rbMic.setText("Microphone");
+        modeGroup.addView(rbInternal);
+        modeGroup.addView(rbMic);
+        root.addView(modeGroup);
+
+        Button startBtn = new Button(this);
+        startBtn.setText("START STREAMING");
+        startBtn.setOnClickListener(v -> checkPermissionsAndStart());
+        root.addView(startBtn);
+
+        Button stopBtn = new Button(this);
+        stopBtn.setText("STOP STREAMING");
+        stopBtn.setOnClickListener(v -> stopStream());
+        root.addView(stopBtn);
+
+        statusText = new TextView(this);
+        statusText.setText("\nStatus: Idle");
+        statusText.setTextSize(16f);
+        root.addView(statusText);
+
+        setContentView(root);
     }
 
-    @Override protected void onResume() {
-        super.onResume();
-        if (status != null && StreamService.isRunning) status.setText("Audio streaming in the background");
-    }
-
-    private void requestStart() {
-        String host = hostField.getText().toString().trim();
-        if (!Patterns.IP_ADDRESS.matcher(host).matches() || host.contains(":")) {
-            hostField.setError("Enter the Windows PC's IPv4 address");
-            return;
-        }
-        requestedHost = host;
-        getPreferences(MODE_PRIVATE).edit().putString("lastHost", host).apply();
+    private void checkPermissionsAndStart() {
         if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[] { Manifest.permission.RECORD_AUDIO }, AUDIO_PERMISSION_REQUEST);
-        } else {
-            askForProjection();
-        }
-    }
-
-    @Override public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grants) {
-        super.onRequestPermissionsResult(requestCode, permissions, grants);
-        if (requestCode != AUDIO_PERMISSION_REQUEST) return;
-        if (grants.length > 0 && grants[0] == PackageManager.PERMISSION_GRANTED) {
-            askForProjection();
-        } else {
-            status.setText("Microphone/record-audio permission is required by Android for playback capture.");
-        }
-    }
-
-    private void askForProjection() {
-        MediaProjectionManager mgr = (MediaProjectionManager) getSystemService(MEDIA_PROJECTION_SERVICE);
-        startActivityForResult(mgr.createScreenCaptureIntent(), PROJECTION_REQUEST);
-    }
-
-    @Override protected void onActivityResult(int requestCode, int resultCode, Intent resultData) {
-        super.onActivityResult(requestCode, resultCode, resultData);
-        if (requestCode != PROJECTION_REQUEST) return;
-        if (resultCode != RESULT_OK || resultData == null) {
-            status.setText("Android capture permission was not granted.");
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                requestPermissions(new String[]{
+                        Manifest.permission.RECORD_AUDIO,
+                        Manifest.permission.POST_NOTIFICATIONS
+                }, REQ_PERMS);
+            } else {
+                requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, REQ_PERMS);
+            }
             return;
         }
-        if (requestedHost == null) {
-            requestedHost = getPreferences(MODE_PRIVATE).getString("lastHost", null);
+        initiateStream();
+    }
+
+    private void initiateStream() {
+        String ip = ipInput.getText().toString().trim();
+        int port = 50005;
+        try {
+            port = Integer.parseInt(portInput.getText().toString().trim());
+        } catch (NumberFormatException ignored) {}
+
+        prefs.edit().putString("ip", ip).putInt("port", port).apply();
+
+        if (rbInternal.isChecked()) {
+            MediaProjectionManager mpm = (MediaProjectionManager) getSystemService(Context.MEDIA_PROJECTION_SERVICE);
+            startActivityForResult(mpm.createScreenCaptureIntent(), REQ_PROJECTION);
+        } else {
+            startStreamService(0, null);
         }
-        Intent service = new Intent(this, StreamService.class);
-        service.putExtra(StreamService.EXTRA_HOST, requestedHost);
-        service.putExtra(StreamService.EXTRA_RESULT_CODE, resultCode);
-        service.putExtra(StreamService.EXTRA_RESULT_DATA, resultData);
-        startForegroundService(service);
-        status.setText("Starting audio stream to " + requestedHost + ":45999");
+    }
+
+    private void startStreamService(int resultCode, Intent data) {
+        Intent serviceIntent = new Intent(this, StreamService.class);
+        serviceIntent.setAction(StreamService.ACTION_START);
+        serviceIntent.putExtra("ip", ipInput.getText().toString().trim());
+        serviceIntent.putExtra("port", Integer.parseInt(portInput.getText().toString().trim()));
+        serviceIntent.putExtra("internal", rbInternal.isChecked());
+        serviceIntent.putExtra("resultCode", resultCode);
+        serviceIntent.putExtra("data", data);
+
+        startForegroundService(serviceIntent);
+        statusText.setText("\nStatus: Streaming to " + ipInput.getText().toString().trim());
+    }
+
+    private void stopStream() {
+        Intent serviceIntent = new Intent(this, StreamService.class);
+        serviceIntent.setAction(StreamService.ACTION_STOP);
+        startService(serviceIntent);
+        statusText.setText("\nStatus: Stopped");
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == REQ_PROJECTION) {
+            if (resultCode == Activity.RESULT_OK && data != null) {
+                startStreamService(resultCode, data);
+            } else {
+                Toast.makeText(this, "Screen/Audio capture permission denied", Toast.LENGTH_SHORT).show();
+            }
+        }
     }
 }

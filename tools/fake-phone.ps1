@@ -24,17 +24,33 @@ for ($i = 0; $i -lt 48000; $i++) {
 $pkt = New-Object byte[] (8 + 2 * $chunk)
 [Text.Encoding]::ASCII.GetBytes("PAU2").CopyTo($pkt, 0)
 $rand = New-Object Random
+function Fill([uint32]$s) {
+    [BitConverter]::GetBytes($s).CopyTo($pkt, 4)
+    [Array]::Copy($tone, ($s % 400) * $chunk, $pkt, 8, $chunk)
+    $old = [Math]::Max(0, [int64]$s - 8)
+    [Array]::Copy($tone, ($old % 400) * $chunk, $pkt, 8 + $chunk, $chunk)
+}
 $sw = [Diagnostics.Stopwatch]::StartNew()
-$seq = 0; $dropped = 0
+$seq = 0; $dropped = 0; $resent = 0; $acks = 0
 while ($sw.Elapsed.TotalSeconds -lt $Seconds) {
     while ($seq * 2.5 -le $sw.ElapsedMilliseconds) {
-        [BitConverter]::GetBytes([uint32]$seq).CopyTo($pkt, 4)
-        [Array]::Copy($tone, ($seq % 400) * $chunk, $pkt, 8, $chunk)
-        $old = $seq - 8; if ($old -lt 0) { $old = 0 }
-        [Array]::Copy($tone, ($old % 400) * $chunk, $pkt, 8 + $chunk, $chunk)
+        Fill $seq
         if ($rand.Next(100) -ge $LossPercent) { [void]$udp.Send($pkt, $pkt.Length, $Target, 45999) } else { $dropped++ }
         $seq++
     }
+    # answer the PC like the real app: "PAUN" resend requests, "PAUK" keep-alives
+    while ($udp.Available -gt 0) {
+        $ep = New-Object System.Net.IPEndPoint ([Net.IPAddress]::Any), 0
+        $m = $udp.Receive([ref]$ep)
+        if ($m.Length -ge 4 -and [Text.Encoding]::ASCII.GetString($m, 0, 4) -eq 'PAUK') { $acks++ }
+        if ($m.Length -ge 6 -and [Text.Encoding]::ASCII.GetString($m, 0, 4) -eq 'PAUN') {
+            $count = [BitConverter]::ToUInt16($m, 4)
+            for ($i = 0; $i -lt $count; $i++) {
+                Fill ([BitConverter]::ToUInt32($m, 6 + 4 * $i))
+                if ($rand.Next(100) -ge $LossPercent) { [void]$udp.Send($pkt, $pkt.Length, $Target, 45999); $resent++ }
+            }
+        }
+    }
     Start-Sleep -Milliseconds 1
 }
-"Sent $seq packets, dropped $dropped on purpose"
+"Sent $seq packets, dropped $dropped on purpose, resent $resent on request, PC keep-alives $acks"

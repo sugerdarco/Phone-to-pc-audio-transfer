@@ -46,6 +46,10 @@ public class StreamService extends Service {
     private static final int SAMPLE_RATE = 48000;
     private static final int CHUNK_BYTES = 480; // 2.5 ms of 48 kHz stereo 16-bit
     private static final int REDUNDANCY = 8;    // each packet also carries the chunk from 20 ms earlier
+    private static final int HISTORY = 1024;    // 2.56 s kept for resend requests (power of two)
+
+    private volatile int sentSeq = -1;
+    private volatile long lastPcContact;
     private static final String CHANNEL_ID = "stream";
     private static final int NOTIFICATION_ID = 1;
 
@@ -59,6 +63,7 @@ public class StreamService extends Service {
     private MediaProjection projection;
     private PowerManager.WakeLock wakeLock;
     private WifiManager.WifiLock wifiLock;
+    private WifiManager.WifiLock wifiPerfLock;
     private String host = "";
     private int savedVolume = -1;
 
@@ -177,13 +182,24 @@ public class StreamService extends Service {
             InetAddress addr = InetAddress.getByName(target);
             socket = new DatagramSocket();
             socket.setTrafficClass(0xB8); // DSCP EF: ask Wi-Fi for voice-priority queueing
-            socket.setSendBufferSize(64 * 1024);
+            socket.setSendBufferSize(256 * 1024);
+            socket.setReceiveBufferSize(64 * 1024);
+            socket.setSoTimeout(500);
 
-            // Packet: "PAU2" | seq | chunk[seq] | chunk[seq - 8]  (the old copy repairs lost packets)
+            // Packet: "PAU2" | seq | chunk[seq] | chunk[seq - 8]  (the old copy repairs lost packets).
+            // The last 2.5 s of chunks are kept so the PC can ask for anything still missing.
             byte[] pkt = new byte[8 + 2 * CHUNK_BYTES];
-            pkt[0] = 'P'; pkt[1] = 'A'; pkt[2] = 'U'; pkt[3] = '2';
-            byte[][] history = new byte[REDUNDANCY][CHUNK_BYTES];
             DatagramPacket dp = new DatagramPacket(pkt, pkt.length, addr, PORT);
+            final byte[][] history = new byte[HISTORY][CHUNK_BYTES];
+            final DatagramSocket sock = socket;
+            lastPcContact = 0;
+            Thread listener = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    listenForPc(sock, history);
+                }
+            }, "pc-listener");
+            listener.start();
 
             rec.startRecording();
             int seq = 0;
@@ -202,34 +218,33 @@ public class StreamService extends Service {
                     got += n;
                 }
                 if (!active) break;
-                pkt[4] = (byte) seq;
-                pkt[5] = (byte) (seq >>> 8);
-                pkt[6] = (byte) (seq >>> 16);
-                pkt[7] = (byte) (seq >>> 24);
-                byte[] old = history[seq % REDUNDANCY];          // chunk from 8 packets (20 ms) ago
-                System.arraycopy(old, 0, pkt, 8 + CHUNK_BYTES, CHUNK_BYTES);
-                System.arraycopy(pkt, 8, old, 0, CHUNK_BYTES);   // remember this chunk
+                synchronized (history) {
+                    buildPacket(pkt, seq, history, false);
+                    System.arraycopy(pkt, 8, history[seq & (HISTORY - 1)], 0, CHUNK_BYTES);
+                    sentSeq = seq;
+                }
                 seq++;
                 try {
                     socket.send(dp);
                     bytesSent += pkt.length;
-                    if (netError) {
-                        netError = false;
-                        status = "Streaming " + label + " to " + target;
-                    }
+                    netError = false;
                 } catch (java.io.IOException e) {
                     // Wi-Fi hiccup / network change: keep capturing, retry on next chunk.
-                    if (!netError) status = "Network unavailable, retrying…";
                     netError = true;
                 }
                 long now = System.nanoTime();
-                if (now - lastReport >= 1_000_000_000L && !netError) {
+                if (now - lastReport >= 1_000_000_000L) {
                     long kbps = bytesSent * 8 / 1000 * 1_000_000_000L / (now - lastReport);
-                    status = "Streaming " + label + " to " + target + "  ·  " + kbps + " kbit/s";
+                    boolean pcOk = System.currentTimeMillis() - lastPcContact < 3000;
+                    if (netError) status = "Network unavailable, retrying…";
+                    else if (pcOk) status = "✓ PC is playing " + label + "  ·  " + kbps + " kbit/s";
+                    else status = "Sending to " + target + ", but the PC isn't answering. " +
+                            "Is Audio Bridge open on the PC? Try “Allow through Windows Firewall” there.";
                     bytesSent = 0;
                     lastReport = now;
                 }
             }
+            listener.join(1000);
         } catch (Exception e) {
             endStatus = "Error: " + e.getMessage();
         } finally {
@@ -248,6 +263,52 @@ public class StreamService extends Service {
                     if (worker == me) shutdown(s);
                 }
             });
+        }
+    }
+
+    /** Fills the header and redundant chunk; pkt[8..] must already hold chunk[seq] unless fromHistory. */
+    private static void buildPacket(byte[] pkt, int seq, byte[][] history, boolean fromHistory) {
+        pkt[0] = 'P'; pkt[1] = 'A'; pkt[2] = 'U'; pkt[3] = '2';
+        pkt[4] = (byte) seq;
+        pkt[5] = (byte) (seq >>> 8);
+        pkt[6] = (byte) (seq >>> 16);
+        pkt[7] = (byte) (seq >>> 24);
+        if (fromHistory) System.arraycopy(history[seq & (HISTORY - 1)], 0, pkt, 8, CHUNK_BYTES);
+        System.arraycopy(history[(seq - REDUNDANCY) & (HISTORY - 1)], 0, pkt, 8 + CHUNK_BYTES, CHUNK_BYTES);
+    }
+
+    /** Handles messages from the PC: resend requests ("PAUN") and keep-alives ("PAUK"). */
+    private void listenForPc(DatagramSocket socket, byte[][] history) {
+        byte[] in = new byte[2048];
+        byte[] out = new byte[8 + 2 * CHUNK_BYTES];
+        DatagramPacket rx = new DatagramPacket(in, in.length);
+        while (active) {
+            try {
+                rx.setLength(in.length);
+                socket.receive(rx);
+            } catch (java.net.SocketTimeoutException e) {
+                continue;
+            } catch (Exception e) {
+                break; // socket closed
+            }
+            int n = rx.getLength();
+            if (n < 4 || in[0] != 'P' || in[1] != 'A' || in[2] != 'U') continue;
+            lastPcContact = System.currentTimeMillis();
+            if (in[3] != 'N' || n < 6) continue;
+            int count = Math.min((in[4] & 0xff) | ((in[5] & 0xff) << 8), (n - 6) / 4);
+            for (int i = 0; i < count; i++) {
+                int o = 6 + i * 4;
+                int s = (in[o] & 0xff) | ((in[o + 1] & 0xff) << 8) | ((in[o + 2] & 0xff) << 16) | ((in[o + 3] & 0xff) << 24);
+                synchronized (history) {
+                    int age = sentSeq - s;
+                    if (age < 0 || age >= HISTORY - 16) continue; // too old (or bogus)
+                    buildPacket(out, s, history, true);
+                }
+                try {
+                    socket.send(new DatagramPacket(out, out.length, rx.getAddress(), PORT));
+                } catch (Exception ignored) {
+                }
+            }
         }
     }
 
@@ -318,9 +379,18 @@ public class StreamService extends Service {
         wakeLock.acquire(12 * 60 * 60 * 1000L);
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(WIFI_SERVICE);
         if (wm != null) {
+            // Low-latency lock works while the screen is on; high-perf keeps Wi-Fi power-save
+            // (which delivers audio in bursts) off with the screen off on phones that honor it.
             wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_LOW_LATENCY, "AudioBridge:wifi");
             wifiLock.setReferenceCounted(false);
             wifiLock.acquire();
+            try {
+                wifiPerfLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "AudioBridge:wifi-perf");
+                wifiPerfLock.setReferenceCounted(false);
+                wifiPerfLock.acquire();
+            } catch (Exception ignored) {
+                wifiPerfLock = null;
+            }
         }
     }
 
@@ -329,6 +399,8 @@ public class StreamService extends Service {
         wakeLock = null;
         if (wifiLock != null && wifiLock.isHeld()) wifiLock.release();
         wifiLock = null;
+        if (wifiPerfLock != null && wifiPerfLock.isHeld()) wifiPerfLock.release();
+        wifiPerfLock = null;
     }
 
     private Notification buildNotification(String text) {

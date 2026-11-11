@@ -1,4 +1,5 @@
-// Minimal WinMM waveOut player. Pulls PCM from a JitterBuffer on its own thread.
+// WinMM waveOut player: 32-bit float output (16-bit fallback), deep buffer queue,
+// "Pro Audio" MMCSS thread priority. Pulls audio from a JitterBuffer on its own thread.
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
@@ -11,6 +12,8 @@ namespace AudioBridge
         public const int WHDR_DONE = 0x1;
         public const int CALLBACK_EVENT = 0x00050000;
         public const int WAVE_MAPPER = -1;
+        public const short WAVE_FORMAT_PCM = 1;
+        public const short WAVE_FORMAT_IEEE_FLOAT = 3;
 
         [StructLayout(LayoutKind.Sequential, Pack = 2)]
         public struct WAVEFORMATEX
@@ -67,6 +70,14 @@ namespace AudioBridge
         public static extern int waveOutGetNumDevs();
         [DllImport("winmm.dll", CharSet = CharSet.Unicode, EntryPoint = "waveOutGetDevCapsW")]
         public static extern int waveOutGetDevCaps(IntPtr uDeviceID, ref WAVEOUTCAPS caps, int size);
+        [DllImport("winmm.dll")]
+        public static extern int timeBeginPeriod(int ms);
+        [DllImport("winmm.dll")]
+        public static extern int timeEndPeriod(int ms);
+        [DllImport("avrt.dll", CharSet = CharSet.Unicode)]
+        public static extern IntPtr AvSetMmThreadCharacteristics(string taskName, ref int taskIndex);
+        [DllImport("avrt.dll")]
+        public static extern bool AvRevertMmThreadCharacteristics(IntPtr handle);
 
         public static List<string> OutputDevices()
         {
@@ -86,19 +97,21 @@ namespace AudioBridge
 
     internal sealed class WaveOutPlayer : IDisposable
     {
-        private const int BufferCount = 4;
+        private const int BufferCount = 6;
+        private const int BufferFrames = 960; // 20 ms -> 120 ms queued at the device
+
         private readonly JitterBuffer source;
         private readonly int deviceId;
-        private readonly int bufferBytes;
         private Thread thread;
         private volatile bool running;
         public volatile string Error;
+        public long DeviceStarved;      // times Windows ran out of queued audio
+        public volatile bool FloatOutput;
 
-        public WaveOutPlayer(JitterBuffer source, int deviceId, int bufferMs)
+        public WaveOutPlayer(JitterBuffer source, int deviceId)
         {
             this.source = source;
             this.deviceId = deviceId;
-            bufferBytes = 192 * bufferMs; // 48 kHz stereo 16-bit
         }
 
         public void Start()
@@ -111,30 +124,49 @@ namespace AudioBridge
             thread.Start();
         }
 
+        private static WinMM.WAVEFORMATEX Format(bool useFloat)
+        {
+            var f = new WinMM.WAVEFORMATEX();
+            f.wFormatTag = useFloat ? WinMM.WAVE_FORMAT_IEEE_FLOAT : WinMM.WAVE_FORMAT_PCM;
+            f.nChannels = 2;
+            f.nSamplesPerSec = JitterBuffer.SampleRate;
+            f.wBitsPerSample = (short)(useFloat ? 32 : 16);
+            f.nBlockAlign = (short)(2 * f.wBitsPerSample / 8);
+            f.nAvgBytesPerSec = f.nSamplesPerSec * f.nBlockAlign;
+            return f;
+        }
+
         private void Run()
         {
-            var fmt = new WinMM.WAVEFORMATEX();
-            fmt.wFormatTag = 1; // PCM
-            fmt.nChannels = 2;
-            fmt.nSamplesPerSec = JitterBuffer.SampleRate;
-            fmt.wBitsPerSample = 16;
-            fmt.nBlockAlign = 4;
-            fmt.nAvgBytesPerSec = JitterBuffer.SampleRate * 4;
+            int mmIndex = 0;
+            IntPtr mmcss = IntPtr.Zero;
+            try { mmcss = WinMM.AvSetMmThreadCharacteristics("Pro Audio", ref mmIndex); } catch { }
+            WinMM.timeBeginPeriod(1);
 
             int hdrSize = Marshal.SizeOf(typeof(WinMM.WAVEHDR));
             int flagsOffset = (int)Marshal.OffsetOf(typeof(WinMM.WAVEHDR), "dwFlags");
             var headers = new IntPtr[BufferCount];
             var datas = new IntPtr[BufferCount];
-            var managed = new byte[bufferBytes];
+            var samples = new float[BufferFrames * 2];
+            var pcm16 = new short[BufferFrames * 2];
             IntPtr hwo = IntPtr.Zero;
+            int bufferBytes = 0;
 
             using (var evt = new AutoResetEvent(false))
             {
                 try
                 {
-                    int rc = WinMM.waveOutOpen(out hwo, new IntPtr(deviceId), ref fmt,
-                        evt.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, WinMM.CALLBACK_EVENT);
-                    if (rc != 0) { Error = "Cannot open audio device (WinMM error " + rc + ")"; return; }
+                    IntPtr cb = evt.SafeWaitHandle.DangerousGetHandle();
+                    var fmt = Format(true);
+                    int rc = WinMM.waveOutOpen(out hwo, new IntPtr(deviceId), ref fmt, cb, IntPtr.Zero, WinMM.CALLBACK_EVENT);
+                    FloatOutput = rc == 0;
+                    if (rc != 0)
+                    {
+                        fmt = Format(false);
+                        rc = WinMM.waveOutOpen(out hwo, new IntPtr(deviceId), ref fmt, cb, IntPtr.Zero, WinMM.CALLBACK_EVENT);
+                    }
+                    if (rc != 0) { hwo = IntPtr.Zero; Error = "Cannot open audio device (WinMM error " + rc + ")"; return; }
+                    bufferBytes = BufferFrames * fmt.nBlockAlign;
 
                     for (int i = 0; i < BufferCount; i++)
                     {
@@ -145,20 +177,21 @@ namespace AudioBridge
                         h.dwBufferLength = bufferBytes;
                         Marshal.StructureToPtr(h, headers[i], false);
                         WinMM.waveOutPrepareHeader(hwo, headers[i], hdrSize);
-                        SafePull(managed);
-                        Marshal.Copy(managed, 0, datas[i], bufferBytes);
+                        Fill(samples, pcm16, datas[i]);
                         WinMM.waveOutWrite(hwo, headers[i], hdrSize);
                     }
 
                     while (running)
                     {
-                        evt.WaitOne(50);
+                        evt.WaitOne(20);
+                        int done = 0;
+                        for (int i = 0; i < BufferCount; i++)
+                            if ((Marshal.ReadInt32(headers[i], flagsOffset) & WinMM.WHDR_DONE) != 0) done++;
+                        if (done == BufferCount) DeviceStarved++;
                         for (int i = 0; i < BufferCount && running; i++)
                         {
-                            int flags = Marshal.ReadInt32(headers[i], flagsOffset);
-                            if ((flags & WinMM.WHDR_DONE) == 0) continue;
-                            SafePull(managed);
-                            Marshal.Copy(managed, 0, datas[i], bufferBytes);
+                            if ((Marshal.ReadInt32(headers[i], flagsOffset) & WinMM.WHDR_DONE) == 0) continue;
+                            Fill(samples, pcm16, datas[i]);
                             rc = WinMM.waveOutWrite(hwo, headers[i], hdrSize);
                             if (rc != 0) { Error = "Audio device error (WinMM " + rc + ")"; running = false; }
                         }
@@ -182,15 +215,29 @@ namespace AudioBridge
                         if (headers[i] != IntPtr.Zero) Marshal.FreeHGlobal(headers[i]);
                         if (datas[i] != IntPtr.Zero) Marshal.FreeHGlobal(datas[i]);
                     }
+                    WinMM.timeEndPeriod(1);
+                    if (mmcss != IntPtr.Zero) { try { WinMM.AvRevertMmThreadCharacteristics(mmcss); } catch { } }
                 }
             }
         }
 
-        private void SafePull(byte[] managed)
+        private void Fill(float[] samples, short[] pcm16, IntPtr dest)
         {
             // A bug in the buffer must never kill playback: output one block of silence instead.
-            try { source.Pull(managed, bufferBytes); }
-            catch { Array.Clear(managed, 0, managed.Length); }
+            try { source.Pull(samples, BufferFrames); }
+            catch { Array.Clear(samples, 0, samples.Length); }
+
+            if (FloatOutput)
+            {
+                Marshal.Copy(samples, 0, dest, samples.Length);
+                return;
+            }
+            for (int i = 0; i < samples.Length; i++)
+            {
+                float v = samples[i] * 32768f;
+                pcm16[i] = (short)(v >= 32767f ? 32767 : (v <= -32768f ? -32768 : (int)Math.Round(v)));
+            }
+            Marshal.Copy(pcm16, 0, dest, pcm16.Length);
         }
 
         public void Dispose()

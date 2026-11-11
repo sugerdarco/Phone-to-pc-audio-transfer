@@ -1,10 +1,12 @@
-// UDP receiver + bit-exact jitter buffer with packet-loss recovery.
+// UDP receiver + music-grade jitter buffer.
 //
 // Wire protocol, UDP port 45999, integers little-endian:
-//   Audio:     "PAU2" | uint32 seq | chunk[seq] | chunk[seq - 8]
-//              chunk = 480 bytes PCM s16le 48 kHz stereo (2.5 ms). The second chunk is a
-//              redundant copy of the audio sent 20 ms earlier, used to repair lost packets.
-//   Discovery: phone sends "PAUD" (broadcast); PC replies "PAUH" + UTF-8 computer name.
+//   phone -> PC  "PAU2" | uint32 seq | chunk[seq] | chunk[seq - 8]
+//                chunk = 480 bytes PCM s16le 48 kHz stereo (2.5 ms); the second chunk is a
+//                redundant copy of audio sent 20 ms earlier (instant repair of single losses).
+//   PC -> phone  "PAUN" | uint16 count | count x uint32 seq   resend request for missing packets
+//   PC -> phone  "PAUK"                                        keep-alive ("PC is receiving")
+//   discovery    phone sends "PAUD" (broadcast); PC replies "PAUH" + UTF-8 computer name
 //
 // Works the same over Wi-Fi, phone hotspot, or USB tethering (a network over the cable).
 using System;
@@ -16,9 +18,12 @@ using System.Threading;
 namespace AudioBridge
 {
     /// <summary>
-    /// Sequence-indexed jitter buffer. Audio is played back sample-for-sample as captured on
-    /// the phone (no resampling, no filtering). Clock drift is corrected by dropping or repeating
-    /// a single sample frame at most once per 10 ms, which is inaudible.
+    /// Sequence-indexed jitter buffer for music.
+    ///  * Missing packets are first repaired from the redundant copy, then re-requested from the
+    ///    phone (several tries) while they are still in the future of the play position.
+    ///  * Phone/PC clock drift is absorbed by a 64-tap Kaiser-windowed sinc resampler whose speed
+    ///    moves by at most +/-0.05% (inaudible; no clicks, no sample drops).
+    ///  * Underruns and catch-up jumps fade out/in instead of cutting.
     /// </summary>
     internal sealed class JitterBuffer
     {
@@ -26,69 +31,127 @@ namespace AudioBridge
         public const int ChunkFrames = 120;                 // 2.5 ms
         public const int ChunkBytes = ChunkFrames * 4;      // 480
         public const int RedundancyDistance = 8;            // chunks (20 ms)
-        public const double ChunkMs = 2.5;
-        private const int Slots = 1024;                     // 2.56 s
-        private const int FadeFrames = 120;
+        private const int Slots = 2048;                     // 5.12 s of packets
+        private const int Taps = 64, Half = 32, Phases = 512;
+        private const int InSize = 8192, InMask = InSize - 1;
+        private const int FadeFrames = 480;                 // 10 ms
+        private const double MaxDeviation = 0.0005;         // +/-500 ppm
+        private const int MaxNackTries = 8;
+        private const int NackIntervalMs = 25;
+        private const int FirstNackDelayMs = 15;
+
+        /// <summary>Millisecond clock (replaceable for offline simulation).</summary>
+        public Func<int> Clock = delegate { return Environment.TickCount; };
+
+        private static readonly float[] Table = BuildTable();
 
         private readonly short[][] slot = new short[Slots][];
         private readonly long[] slotSeq = new long[Slots];
+        private readonly long[] nackSeq = new long[Slots];
+        private readonly int[] nackTick = new int[Slots];
+        private readonly byte[] nackTries = new byte[Slots];
         private readonly object gate = new object();
 
-        private bool started;           // received anything in this session
-        private long sessionStart;      // first seq of this session
-        private long highest = -1;      // highest seq received
-        private long playSeq;           // seq of the chunk currently being played
+        private bool started;
+        private long sessionStart;
+        private long highest = -1;
         private bool primed;
-        private readonly short[] cur = new short[ChunkFrames * 2];
-        private int curPos = ChunkFrames; // frame index inside cur; == ChunkFrames means "load next"
-        private int fadeIn;
-        private int concealed;          // consecutive concealed chunks
+        private long playSeq;               // last chunk moved into the resampler input
+
+        private readonly float[] inL = new float[InSize], inR = new float[InSize];
+        private long inWrite;               // absolute frames written to the input ring
+        private double pos;                 // absolute input position of the next output frame
+        private readonly float[] lastChunk = new float[ChunkFrames * 2];
+        private int concealRun;
+        private bool rampNext;
+
         private double avgLag = -1;
-        private int targetChunks = 32;
-        private short lastL, lastR;
+        private int blocksSincePrime;
+        private double ratio = 1.0;
+        private int targetFrames = 300 * 48;
+        private int fadeIn, fadeOut;
+        private bool jumpAfterFade;
+        private float gain = 1f;
+        private float lastOutL, lastOutR;
 
         public volatile int VolumePercent = 100;
-        public long Underruns, Recovered, Concealed, Slips;
-        public volatile int Peak;
+        public long Underruns, Recovered, Resent, Concealed, Jumps;
+        public volatile int Peak;           // 0..32767
+        public volatile float DriftPpm;
 
         public JitterBuffer()
         {
-            for (int i = 0; i < Slots; i++) { slot[i] = new short[ChunkFrames * 2]; slotSeq[i] = -1; }
+            for (int i = 0; i < Slots; i++) { slot[i] = new short[ChunkFrames * 2]; slotSeq[i] = -1; nackSeq[i] = -1; }
         }
+
+        private static float[] BuildTable()
+        {
+            // Fractional-delay windowed sinc. Phase 0 is an exact unit impulse, so with no drift
+            // correction the output equals the input sample-for-sample.
+            const double beta = 8.6;
+            var t = new float[(Phases + 1) * Taps];
+            double i0b = BesselI0(beta);
+            for (int p = 0; p <= Phases; p++)
+            {
+                double f = (double)p / Phases, sum = 0;
+                var row = new double[Taps];
+                for (int k = 0; k < Taps; k++)
+                {
+                    double x = (k - (Half - 1)) - f;            // distance from the output point
+                    double sinc = Math.Abs(x) < 1e-9 ? 1.0 : Math.Sin(Math.PI * x) / (Math.PI * x);
+                    double r = x / Half;
+                    double w = Math.Abs(r) >= 1 ? 0 : BesselI0(beta * Math.Sqrt(1 - r * r)) / i0b;
+                    row[k] = sinc * w;
+                    sum += row[k];
+                }
+                for (int k = 0; k < Taps; k++) t[p * Taps + k] = (float)(row[k] / sum);
+            }
+            return t;
+        }
+
+        private static double BesselI0(double x)
+        {
+            double sum = 1, term = 1, q = x * x / 4;
+            for (int k = 1; k < 50; k++) { term *= q / (k * k); sum += term; if (term < 1e-12 * sum) break; }
+            return sum;
+        }
+
+        private static int Idx(long seq) { return (int)(((seq % Slots) + Slots) % Slots); }
 
         public int TargetMs
         {
-            set { lock (gate) { targetChunks = Math.Max(4, (int)Math.Round(value / ChunkMs)); avgLag = -1; } }
+            set { lock (gate) { targetFrames = value * 48; avgLag = -1; } }
         }
 
         public int BufferedMs
         {
-            get { lock (gate) return primed ? (int)((highest - playSeq) * ChunkMs) : 0; }
+            get { lock (gate) return primed ? (int)(LagFrames() / 48) : 0; }
+        }
+
+        private long LagFrames()
+        {
+            return (highest - playSeq) * ChunkFrames + (inWrite - (long)pos);
         }
 
         public void Reset()
         {
             lock (gate)
             {
-                started = false; highest = -1; primed = false; curPos = ChunkFrames; avgLag = -1; concealed = 0;
-                for (int i = 0; i < Slots; i++) slotSeq[i] = -1;
-                Underruns = Recovered = Concealed = Slips = 0;
+                started = false; highest = -1; primed = false; avgLag = -1; ratio = 1.0;
+                concealRun = 0; fadeOut = 0; jumpAfterFade = false;
+                for (int i = 0; i < Slots; i++) { slotSeq[i] = -1; nackSeq[i] = -1; }
+                Underruns = Recovered = Resent = Concealed = Jumps = 0;
             }
         }
 
-        /// <summary>Unwraps a 32-bit sequence number relative to the newest one seen.</summary>
         public long Unwrap(uint seq)
         {
-            lock (gate)
-            {
-                if (highest < 0) return seq;
-                return highest + unchecked((int)(seq - (uint)highest));
-            }
+            lock (gate) return highest < 0 ? seq : highest + unchecked((int)(seq - (uint)highest));
         }
 
         public bool IsFarBehind(long seq)
         {
-            lock (gate) return highest >= 0 && seq < highest - 400;
+            lock (gate) return highest >= 0 && seq < highest - 1000;
         }
 
         public void Push(long seq, byte[] buf, int mainOffset, int redundantOffset)
@@ -97,155 +160,222 @@ namespace AudioBridge
             {
                 if (!started) { started = true; highest = seq - 1; sessionStart = seq; }
                 Store(seq, buf, mainOffset, false);
-                if (redundantOffset >= 0 && seq >= RedundancyDistance)
+                if (redundantOffset >= 0 && seq - RedundancyDistance >= sessionStart)
                     Store(seq - RedundancyDistance, buf, redundantOffset, true);
                 if (seq > highest) highest = seq;
 
                 if (!primed)
                 {
-                    // Start (or restart after underrun) once a target's worth of audio is queued.
+                    int targetChunks = targetFrames / ChunkFrames;
                     long first = Math.Max(highest - targetChunks + 1, sessionStart);
-                    if (CountValid(first, highest) >= targetChunks * 3 / 4)
-                    {
-                        primed = true;
-                        playSeq = first - 1;
-                        curPos = ChunkFrames;
-                        fadeIn = FadeFrames;
-                        concealed = 0;
-                        avgLag = -1;
-                    }
-                }
-                else if (highest - playSeq > targetChunks + 80)
-                {
-                    // Large burst after a Wi-Fi stall: jump forward instead of keeping the extra delay.
-                    playSeq = highest - targetChunks;
-                    curPos = ChunkFrames;
-                    fadeIn = FadeFrames;
-                    Slips++;
+                    if (highest - first + 1 >= targetChunks * 9 / 10 && CountValid(first, highest) >= targetChunks * 9 / 10)
+                        Prime(first - 1);
                 }
             }
+        }
+
+        private void Prime(long beforeFirst)
+        {
+            primed = true;
+            playSeq = beforeFirst;
+            Array.Clear(inL, 0, InSize);
+            Array.Clear(inR, 0, InSize);
+            inWrite = Half;
+            pos = Half;
+            fadeIn = FadeFrames;
+            fadeOut = 0;
+            jumpAfterFade = false;
+            concealRun = 0;
+            avgLag = -1;
+            blocksSincePrime = 0;
         }
 
         private int CountValid(long from, long to)
         {
             int n = 0;
-            for (long s = Math.Max(0, from); s <= to; s++) if (slotSeq[(int)(s % Slots)] == s) n++;
+            for (long s = from; s <= to; s++) if (slotSeq[Idx(s)] == s) n++;
             return n;
         }
 
         private void Store(long seq, byte[] buf, int offset, bool redundant)
         {
-            if (seq < 0 || (primed && seq <= playSeq) || seq < highest - Slots + 1) return;
-            int i = (int)(seq % Slots);
+            if (seq < sessionStart || (primed && seq <= playSeq) || seq <= highest - Slots) return;
+            int i = Idx(seq);
             if (slotSeq[i] == seq) return;
             short[] d = slot[i];
             for (int k = 0; k < ChunkFrames * 2; k++)
                 d[k] = (short)(buf[offset + k * 2] | (buf[offset + k * 2 + 1] << 8));
             slotSeq[i] = seq;
             if (redundant) Recovered++;
+            else if (nackSeq[i] == seq && nackTries[i] > 0) Resent++;
         }
 
-        /// <summary>Fills dst with len bytes of output.</summary>
-        public void Pull(byte[] dst, int len)
+        /// <summary>Missing packets that are still worth asking the phone for.</summary>
+        public int CollectMissing(uint[] output)
         {
-            int frames = len / 4;
-            int vol = VolumePercent;
-            int peak = 0;
             lock (gate)
             {
-                // Drift control: decide whether this block drops or repeats one frame.
-                int slip = 0;
-                if (primed)
+                if (!started) return 0;
+                long from = primed ? playSeq + 1 : Math.Max(sessionStart, highest - Slots / 2);
+                long to = highest - 2; // tolerate a little reordering
+                int now = Clock(), n = 0;
+                for (long s = from; s <= to && n < output.Length; s++)
                 {
-                    double lag = highest - playSeq;
-                    avgLag = avgLag < 0 ? lag : avgLag + (lag - avgLag) * 0.005; // ~2 s smoothing
-                    if (avgLag > targetChunks + 2) slip = 1;        // too much delay: drop a frame
-                    else if (avgLag < targetChunks - 2) slip = -1;  // running dry: repeat a frame
+                    int i = Idx(s);
+                    if (slotSeq[i] == s) continue;
+                    // First noticed: give it 15 ms to arrive late/out of order before asking.
+                    if (nackSeq[i] != s) { nackSeq[i] = s; nackTries[i] = 0; nackTick[i] = now - NackIntervalMs + FirstNackDelayMs; }
+                    if (nackTries[i] >= MaxNackTries || now - nackTick[i] < NackIntervalMs) continue;
+                    nackTries[i]++;
+                    nackTick[i] = now;
+                    output[n++] = unchecked((uint)s);
+                }
+                return n;
+            }
+        }
+
+        /// <summary>Fills dst (interleaved stereo float) with frames of output.</summary>
+        public void Pull(float[] dst, int frames)
+        {
+            float peak = 0;
+            float targetGain = VolumePercent / 100f;
+            lock (gate)
+            {
+                if (!primed)
+                {
+                    FadeTail(dst, 0, frames);
+                    Peak = 0;
+                    return;
+                }
+
+                // --- drift control (once per block) ---
+                long lag = LagFrames();
+                avgLag = avgLag < 0 ? lag : avgLag + (lag - avgLag) * 0.003;      // ~6 s smoothing
+                double errSec = (avgLag - targetFrames) / SampleRate;
+                double want = 1.0 + Math.Max(-MaxDeviation, Math.Min(MaxDeviation, errSec * 0.004)); // gentle: smooth pitch matters more than exact delay
+                ratio += (want - ratio) * 0.02;
+                DriftPpm = (float)((ratio - 1.0) * 1e6);
+
+                // Way too much audio queued (after a long Wi-Fi stall or a burst at start-up):
+                // fade out and jump back to the target delay once, instead of creeping down for minutes.
+                blocksSincePrime++;
+                bool hugeNow = lag > targetFrames * 2 + SampleRate / 2;
+                bool tooHighSettled = blocksSincePrime > 500 && avgLag > targetFrames + Math.Max(SampleRate / 10, targetFrames / 2);
+                if (!jumpAfterFade && (hugeNow || tooHighSettled))
+                {
+                    jumpAfterFade = true;
+                    fadeOut = FadeFrames;
                 }
 
                 for (int i = 0; i < frames; i++)
                 {
-                    if (curPos >= ChunkFrames && !LoadNext())
+                    if (jumpAfterFade && fadeOut == 0)
                     {
-                        // Underrun: fade the tail to silence.
-                        FadeOut(dst, i, frames);
-                        Peak = Math.Min(peak, 32767);
-                        return;
+                        Jumps++;
+                        Prime(highest - targetFrames / ChunkFrames);
                     }
-                    int l = cur[curPos * 2], r = cur[curPos * 2 + 1];
-                    if (slip == 1 && curPos > 0 && curPos < ChunkFrames - 1) { curPos++; slip = 0; Slips++; l = cur[curPos * 2]; r = cur[curPos * 2 + 1]; }
-                    if (slip == -1 && curPos > 0) { curPos--; slip = 0; Slips++; }
-                    curPos++;
 
-                    if (fadeIn > 0)
+                    long n = (long)pos;
+                    while (inWrite - n < Half + 1)
                     {
-                        int g = FadeFrames - fadeIn;
-                        l = l * g / FadeFrames; r = r * g / FadeFrames;
-                        fadeIn--;
+                        if (!LoadNext())
+                        {
+                            primed = false;          // network underrun: fade out, re-buffer
+                            Underruns++;
+                            FadeTail(dst, i, frames);
+                            Peak = (int)(Math.Min(1f, peak) * 32767);
+                            return;
+                        }
                     }
-                    if (vol != 100) { l = Clip(l * vol / 100); r = Clip(r * vol / 100); }
-                    int o = i * 4;
-                    dst[o] = (byte)l; dst[o + 1] = (byte)(l >> 8);
-                    dst[o + 2] = (byte)r; dst[o + 3] = (byte)(r >> 8);
-                    lastL = (short)l; lastR = (short)r;
-                    int al = l < 0 ? -l : l, ar = r < 0 ? -r : r;
+
+                    double frac = pos - n;
+                    double ph = frac * Phases;
+                    int p0 = (int)ph;
+                    float pf = (float)(ph - p0);
+                    int t0 = p0 * Taps, t1 = t0 + Taps;
+                    long start = n - (Half - 1);
+                    float l = 0, r = 0;
+                    if (p0 == 0 && pf == 0f)
+                    {
+                        int c = (int)((start + Half - 1) & InMask);
+                        l = inL[c]; r = inR[c];
+                    }
+                    else
+                    {
+                        for (int k = 0; k < Taps; k++)
+                        {
+                            float c = Table[t0 + k] + (Table[t1 + k] - Table[t0 + k]) * pf;
+                            int x = (int)((start + k) & InMask);
+                            l += inL[x] * c;
+                            r += inR[x] * c;
+                        }
+                    }
+                    pos += ratio;
+
+                    float g = gain += (targetGain - gain) * 0.002f;
+                    if (fadeIn > 0) { g *= 1f - (float)fadeIn / FadeFrames; fadeIn--; }
+                    if (fadeOut > 0) { g *= (float)fadeOut / FadeFrames; fadeOut--; }
+                    else if (jumpAfterFade) g = 0;
+                    l *= g; r *= g;
+                    dst[i * 2] = l; dst[i * 2 + 1] = r;
+                    lastOutL = l; lastOutR = r;
+                    float al = l < 0 ? -l : l, ar = r < 0 ? -r : r;
                     if (al > peak) peak = al;
                     if (ar > peak) peak = ar;
                 }
             }
-            Peak = Math.Min(peak, 32767);
+            Peak = (int)(Math.Min(1f, peak) * 32767);
         }
 
+        /// <summary>Moves the next packet into the resampler input. False = nothing to play yet.</summary>
         private bool LoadNext()
         {
-            if (!primed) return false;
             long next = playSeq + 1;
-            if (next > highest)
-            {
-                primed = false;     // nothing newer has arrived: real underrun, re-buffer
-                Underruns++;
-                return false;
-            }
+            if (next > highest) return false;
             playSeq = next;
-            curPos = 0;
-            int i = (int)(((next % Slots) + Slots) % Slots);
-            if (next >= 0 && slotSeq[i] == next)
+            int i = Idx(next);
+            int w = (int)(inWrite & InMask);
+            if (slotSeq[i] == next)
             {
-                Array.Copy(slot[i], cur, cur.Length);
-                if (concealed > 0) { fadeIn = FadeFrames; concealed = 0; }
+                short[] d = slot[i];
+                bool ramp = rampNext;
+                for (int k = 0; k < ChunkFrames; k++)
+                {
+                    float gk = ramp ? (float)k / ChunkFrames : 1f;
+                    float l = d[k * 2] / 32768f * gk, r = d[k * 2 + 1] / 32768f * gk;
+                    lastChunk[k * 2] = l; lastChunk[k * 2 + 1] = r;
+                    inL[(w + k) & InMask] = l; inR[(w + k) & InMask] = r;
+                }
+                rampNext = false;
+                concealRun = 0;
             }
             else
             {
-                // Lost and not recoverable: repeat the previous 2.5 ms, fading out if losses continue.
+                // Lost even after resend requests: replay the previous 2.5 ms fading to silence.
                 Concealed++;
-                concealed++;
-                if (concealed > 1) Array.Clear(cur, 0, cur.Length);
-                else
-                    for (int k = 0; k < ChunkFrames; k++)
-                    {
-                        int g = ChunkFrames - k;
-                        cur[k * 2] = (short)(cur[k * 2] * g / ChunkFrames);
-                        cur[k * 2 + 1] = (short)(cur[k * 2 + 1] * g / ChunkFrames);
-                    }
+                for (int k = 0; k < ChunkFrames; k++)
+                {
+                    float gk = concealRun == 0 ? 1f - (float)k / ChunkFrames : 0f;
+                    inL[(w + k) & InMask] = lastChunk[k * 2] * gk;
+                    inR[(w + k) & InMask] = lastChunk[k * 2 + 1] * gk;
+                }
+                concealRun++;
+                rampNext = true;
             }
+            inWrite += ChunkFrames;
             return true;
         }
 
-        private void FadeOut(byte[] dst, int from, int frames)
+        private void FadeTail(float[] dst, int from, int frames)
         {
-            short sl0 = lastL, sr0 = lastR;
+            float l0 = lastOutL, r0 = lastOutR;
             for (int i = from, k = 0; i < frames; i++, k++)
             {
-                int g = k < FadeFrames ? FadeFrames - k : 0;
-                short l = (short)(sl0 * g / FadeFrames), r = (short)(sr0 * g / FadeFrames);
-                int o = i * 4;
-                dst[o] = (byte)l; dst[o + 1] = (byte)(l >> 8);
-                dst[o + 2] = (byte)r; dst[o + 3] = (byte)(r >> 8);
-                lastL = l; lastR = r;
+                float g = k < FadeFrames ? 1f - (float)k / FadeFrames : 0f;
+                dst[i * 2] = l0 * g; dst[i * 2 + 1] = r0 * g;
             }
+            lastOutL = 0; lastOutR = 0;
         }
-
-        private static int Clip(int v) { return v > 32767 ? 32767 : (v < -32768 ? -32768 : v); }
     }
 
     internal sealed class AudioReceiver : IDisposable
@@ -256,9 +386,9 @@ namespace AudioBridge
 
         private readonly JitterBuffer buffer;
         private Socket udp;
-        private Thread thread;
+        private Thread thread, nackThread;
         private volatile bool running;
-        private volatile IPAddress sender;
+        private volatile IPEndPoint sender;
         private int lastPacketTick;
 
         public long Packets;
@@ -270,24 +400,29 @@ namespace AudioBridge
         {
             get
             {
-                IPAddress s = sender;
+                IPEndPoint s = sender;
                 if (s == null || Environment.TickCount - lastPacketTick > 1500) return null;
-                return s;
+                return s.Address;
             }
         }
 
         public void Start()
         {
             udp = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-            udp.ReceiveBufferSize = 1 << 20;
+            udp.ReceiveBufferSize = 4 << 20;
             try { udp.IOControl(SIO_UDP_CONNRESET, new byte[] { 0, 0, 0, 0 }, null); } catch { }
             udp.Bind(new IPEndPoint(IPAddress.Any, Port));
             running = true;
             thread = new Thread(Loop);
             thread.IsBackground = true;
             thread.Name = "udp-rx";
-            thread.Priority = ThreadPriority.AboveNormal;
+            thread.Priority = ThreadPriority.Highest;
             thread.Start();
+            nackThread = new Thread(NackLoop);
+            nackThread.IsBackground = true;
+            nackThread.Name = "udp-nack";
+            nackThread.Priority = ThreadPriority.AboveNormal;
+            nackThread.Start();
         }
 
         private void Loop()
@@ -321,24 +456,57 @@ namespace AudioBridge
                 }
                 if (buf[3] != '2' || n != PacketBytes) continue;
 
-                IPAddress addr = ((IPEndPoint)from).Address;
+                var ep = (IPEndPoint)from;
+                IPEndPoint cur = sender;
                 int now = Environment.TickCount;
                 bool stale = now - lastPacketTick > 1000;
-                if (sender != null && !sender.Equals(addr) && !stale) continue; // one phone at a time
+                if (cur != null && !cur.Address.Equals(ep.Address) && !stale) continue; // one phone at a time
 
                 uint raw = BitConverter.ToUInt32(buf, 4);
                 long seq = buffer.Unwrap(raw);
                 // New phone, long pause, or the phone restarted its stream (sequence jumped far back).
-                if (stale || sender == null || !sender.Equals(addr) || buffer.IsFarBehind(seq))
+                if (stale || cur == null || !cur.Equals(ep) || buffer.IsFarBehind(seq))
                 {
                     buffer.Reset();
                     seq = raw;
                 }
-                sender = addr;
+                sender = ep;
                 lastPacketTick = now;
                 Packets++;
                 Error = null;
                 buffer.Push(seq, buf, 8, 8 + JitterBuffer.ChunkBytes);
+            }
+        }
+
+        // Every 10 ms: ask the phone to resend missing packets; every second: tell it we're alive.
+        private void NackLoop()
+        {
+            var seqs = new uint[100];
+            var pkt = new byte[6 + 4 * seqs.Length];
+            pkt[0] = (byte)'P'; pkt[1] = (byte)'A'; pkt[2] = (byte)'U'; pkt[3] = (byte)'N';
+            byte[] keepAlive = Encoding.ASCII.GetBytes("PAUK");
+            int lastKeepAlive = 0;
+            while (running)
+            {
+                Thread.Sleep(10);
+                IPEndPoint ep = sender;
+                if (ep == null || Environment.TickCount - lastPacketTick > 1500) continue;
+                try
+                {
+                    int n = buffer.CollectMissing(seqs);
+                    if (n > 0)
+                    {
+                        pkt[4] = (byte)n; pkt[5] = (byte)(n >> 8);
+                        for (int i = 0; i < n; i++) Array.Copy(BitConverter.GetBytes(seqs[i]), 0, pkt, 6 + i * 4, 4);
+                        udp.SendTo(pkt, 6 + n * 4, SocketFlags.None, ep);
+                    }
+                    if (Environment.TickCount - lastKeepAlive > 1000)
+                    {
+                        lastKeepAlive = Environment.TickCount;
+                        udp.SendTo(keepAlive, ep);
+                    }
+                }
+                catch { }
             }
         }
 
@@ -347,6 +515,7 @@ namespace AudioBridge
             running = false;
             if (udp != null) { try { udp.Close(); } catch { } udp = null; }
             if (thread != null) { thread.Join(1000); thread = null; }
+            if (nackThread != null) { nackThread.Join(1000); nackThread = null; }
         }
     }
 }

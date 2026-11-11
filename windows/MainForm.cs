@@ -39,8 +39,8 @@ namespace AudioBridge
 
     internal sealed class MainForm : Form
     {
-        private static readonly int[] LatencyMs = { 30, 80, 150 };
-        private static readonly string[] LatencyNames = { "Low, 30 ms (USB cable)", "Normal, 80 ms", "Stable, 150 ms (weak Wi-Fi)" };
+        private static readonly int[] LatencyMs = { 300, 150, 60 };
+        private static readonly string[] LatencyNames = { "Music, 300 ms (smoothest)", "Balanced, 150 ms", "Low delay, 60 ms (video, USB)" };
 
         private readonly JitterBuffer buffer = new JitterBuffer();
         private AudioReceiver receiver;
@@ -132,8 +132,8 @@ namespace AudioBridge
             latencyBox.DropDownStyle = ComboBoxStyle.DropDownList;
             latencyBox.Width = 290;
             latencyBox.Items.AddRange(LatencyNames);
-            latencyBox.SelectedIndex = Clamp(ParseInt(Get("latency", "1"), 1), 0, 2);
-            latencyBox.SelectedIndexChanged += delegate { ApplyLatency(); Set("latency", latencyBox.SelectedIndex.ToString()); };
+            latencyBox.SelectedIndex = Clamp(ParseInt(Get("buffer", "0"), 0), 0, 2);
+            latencyBox.SelectedIndexChanged += delegate { ApplyLatency(); Set("buffer", latencyBox.SelectedIndex.ToString()); };
             AddRow(grid, 7, "Buffer", latencyBox);
 
             var volPanel = new FlowLayoutPanel();
@@ -226,7 +226,7 @@ namespace AudioBridge
         {
             if (player != null) { player.Dispose(); player = null; }
             int id = deviceBox.SelectedIndex <= 0 ? WinMM.WAVE_MAPPER : deviceBox.SelectedIndex - 1;
-            player = new WaveOutPlayer(buffer, id, 10);
+            player = new WaveOutPlayer(buffer, id);
             player.Start();
         }
 
@@ -251,8 +251,12 @@ namespace AudioBridge
                 statusLabel.Text = "Waiting for phone (Wi-Fi or USB tethering)…";
                 statusLabel.ForeColor = SystemColors.ControlText;
             }
-            statsLabel.Text = string.Format("48 kHz 16-bit PCM, uncompressed · buffer {0} ms\nrepaired {1} · lost {2} · underruns {3}",
-                from != null ? buffer.BufferedMs : 0, buffer.Recovered, buffer.Concealed, buffer.Underruns);
+            long dropouts = buffer.Underruns + (player != null ? player.DeviceStarved : 0);
+            statsLabel.Text = string.Format(
+                "48 kHz uncompressed → {0} · buffer {1} ms · clock {2:+0;-0;0} ppm\nrepaired {3} · resent {4} · lost {5} · dropouts {6}",
+                player != null && player.FloatOutput ? "32-bit float" : "16-bit",
+                from != null ? buffer.BufferedMs : 0, from != null ? buffer.DriftPpm : 0,
+                buffer.Recovered, buffer.Resent, buffer.Concealed, dropouts);
             int peak = from != null ? buffer.Peak : 0;
             level.Value = Clamp((int)(Math.Sqrt(peak / 32767.0) * 100), 0, 100);
             tray.Text = from != null ? "Audio Bridge – playing from " + from : "Audio Bridge – waiting";
